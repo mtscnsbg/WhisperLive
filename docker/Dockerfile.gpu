@@ -1,6 +1,10 @@
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 
+ENV WHISPER_LIVE_MAX_CLIENTS="4"
+ENV WHISPER_LIVE_MAX_CONNECT_TIMEOUT="1800"
+ENV WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY="1"
+
 # Remove any third-party apt sources to avoid issues with expiring keys.
 RUN rm -f /etc/apt/sources.list.d/*.list
 
@@ -17,11 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m pip install --upgrade pip \
     && rm -rf /var/lib/apt/lists/*
 
+
 # Create a working directory.
 RUN mkdir /app
 WORKDIR /app
 
-COPY scripts/setup.sh requirements/server.txt /app
+COPY scripts/setup.sh requirements/server.txt /app/
 
 RUN apt update && bash setup.sh && rm setup.sh
 RUN pip install -r server.txt && rm server.txt

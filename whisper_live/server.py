@@ -17,6 +17,20 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO)
 
+WHISPER_LIVE_MAX_CLIENTS = 4
+if "WHISPER_LIVE_MAX_CLIENTS" in os.environ:
+    logging.info(f"WHISPER_LIVE_MAX_CLIENTS from {WHISPER_LIVE_MAX_CLIENTS} to {os.environ['WHISPER_LIVE_MAX_CLIENTS']}")
+    WHISPER_LIVE_MAX_CLIENTS = int(os.environ["WHISPER_LIVE_MAX_CLIENTS"])
+
+WHISPER_LIVE_MAX_CONNECT_TIMEOUT = 1800
+if "WHISPER_LIVE_MAX_CONNECT_TIMEOUT" in os.environ:
+    logging.info(f"WHISPER_LIVE_MAX_CONNECT_TIMEOUT from {WHISPER_LIVE_MAX_CONNECT_TIMEOUT} to {os.environ['WHISPER_LIVE_MAX_CONNECT_TIMEOUT']}")
+    WHISPER_LIVE_MAX_CONNECT_TIMEOUT = int(os.environ["WHISPER_LIVE_MAX_CONNECT_TIMEOUT"])
+
+WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY=False
+if "WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY" in os.environ:
+    logging.info(f"WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY from {WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY} to {os.environ['WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY']}")
+    WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY = bool(os.environ["WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY"])
 
 class ClientManager:
     def __init__(self, max_clients=4, max_connection_time=600):
@@ -125,7 +139,9 @@ class TranscriptionServer:
     RATE = 16000
 
     def __init__(self):
-        self.client_manager = ClientManager()
+        max_clients = WHISPER_LIVE_MAX_CLIENTS
+        max_connect_time = WHISPER_LIVE_MAX_CONNECT_TIMEOUT
+        self.client_manager = ClientManager(max_clients, max_connect_time)
         self.no_voice_activity_chunks = 0
         self.use_vad = True
 
@@ -215,7 +231,29 @@ class TranscriptionServer:
             return False
 
     def process_audio_frames(self, websocket):
-        frame_np = self.get_audio_from_websocket(websocket)
+        # frame_np = self.get_audio_from_websocket(websocket)
+        frame_data = websocket.recv()
+        if isinstance(frame_data, str):
+            try:
+                # Set option
+                # here assume the client is not doing transcribing audio 
+                option = json.loads(frame_data)
+                logging.info(f"option: {option}")
+                
+                if "language" in option:
+                    # update target client's language 
+                    self.client_manager.clients[websocket].language = option["language"]
+                    logging.info(f"self.client_manager.clients[websocket].language : {self.client_manager.clients[websocket].language }")
+
+                return True
+            except:
+                logging.info(f"Bad message: {frame_data}")
+                return False
+
+
+        if frame_data == b"END_OF_AUDIO":
+            return False
+        frame_np = np.frombuffer(frame_data, dtype=np.float32)
         client = self.client_manager.get_client(websocket)
         if frame_np is False:
             if self.backend == "tensorrt":
@@ -364,7 +402,11 @@ class ServeClientBase(object):
         self.frames_offset = 0.0
         self.text = []
         self.current_out = ''
+        self.current_no_speech_prob= 0.0
+        self.current_avg_logprob = 0.0
         self.prev_out = ''
+        self.pre_no_speech_prob = 0.0
+        self.pre_avg_logprob = 0.0
         self.t_start = None
         self.exit = False
         self.same_output_threshold = 0
@@ -712,18 +754,20 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.initial_prompt = initial_prompt
         self.vad_parameters = vad_parameters or {"threshold": 0.5}
         self.no_speech_thresh = 0.45
-
+        self.transcribe_status = None
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if self.model_size_or_path is None:
             return
 
+        local_files_only=WHISPER_LIVE_LOAD_MODEL_LOCAL_ONLY
         self.transcriber = WhisperModel(
             self.model_size_or_path,
             device=device,
             compute_type="int8" if device == "cpu" else "float16",
-            local_files_only=False,
+            local_files_only=local_files_only,
         )
+    
         self.use_vad = use_vad
 
         # threading
@@ -777,6 +821,12 @@ class ServeClientFasterWhisper(ServeClientBase):
             logging.info(f"Detected language {self.language} with probability {info.language_probability}")
             self.websocket.send(json.dumps(
                 {"uid": self.client_uid, "language": self.language, "language_prob": info.language_probability}))
+
+
+    def set_transcribe_status(self, transcribe_status):
+        if self.transcribe_status != transcribe_status:
+            self.transcribe_status =transcribe_status
+            self.websocket.send(json.dumps({"uid": self.client_uid, "transcribe_status": self.transcribe_status}))
 
     def transcribe_audio(self, input_sample):
         """
@@ -876,19 +926,23 @@ class ServeClientFasterWhisper(ServeClientBase):
                 break
 
             if self.frames_np is None:
+                self.set_transcribe_status("no input frame")
                 continue
 
             self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
             if duration < 1.0:
+                self.set_transcribe_status("buffer not enough")
                 continue
             try:
+                self.set_transcribe_status("running")
                 input_sample = input_bytes.copy()
                 result = self.transcribe_audio(input_sample)
-
                 if result is None or self.language is None:
                     self.timestamp_offset += duration
+                    if result is None:
+                        self.set_transcribe_status("no_voice_activity")
                     time.sleep(0.25)    # wait for voice activity, result is None when no voice activity
                     continue
                 self.handle_transcription_output(result, duration)
@@ -897,7 +951,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                 logging.error(f"[ERROR]: Failed to transcribe audio chunk: {e}")
                 time.sleep(0.01)
 
-    def format_segment(self, start, end, text):
+    def format_segment(self, start, end, text, no_speech_prob, avg_logprob):
         """
         Formats a transcription segment with precise start and end times alongside the transcribed text.
 
@@ -914,7 +968,9 @@ class ServeClientFasterWhisper(ServeClientBase):
         return {
             'start': "{:.3f}".format(start),
             'end': "{:.3f}".format(end),
-            'text': text
+            'text': text,
+            'no_speech_prob': "{:.3f}".format(no_speech_prob),
+            'avg_logprob':"{:.3f}".format(avg_logprob),
         }
 
     def update_segments(self, segments, duration):
@@ -940,6 +996,10 @@ class ServeClientFasterWhisper(ServeClientBase):
         """
         offset = None
         self.current_out = ''
+        self.current_no_speech_prob = 0.0
+        if len(segments) == 0:
+            return None
+        
         # process complete segments
         if len(segments) > 1:
             for i, s in enumerate(segments[:-1]):
@@ -952,14 +1012,18 @@ class ServeClientFasterWhisper(ServeClientBase):
                 if s.no_speech_prob > self.no_speech_thresh:
                     continue
 
-                self.transcript.append(self.format_segment(start, end, text_))
+                self.transcript.append(self.format_segment(start, end, text_, s.no_speech_prob, s.avg_logprob))
                 offset = min(duration, s.end)
 
         self.current_out += segments[-1].text
+        self.current_no_speech_prob = segments[-1].no_speech_prob
+        self.current_avg_logprob = segments[-1].avg_logprob
         last_segment = self.format_segment(
             self.timestamp_offset + segments[-1].start,
             self.timestamp_offset + min(duration, segments[-1].end),
-            self.current_out
+            self.current_out,
+            segments[-1].no_speech_prob,
+            segments[-1].avg_logprob
         )
 
         # if same incomplete segment is seen multiple times then update the offset
@@ -975,14 +1039,19 @@ class ServeClientFasterWhisper(ServeClientBase):
                 self.transcript.append(self.format_segment(
                     self.timestamp_offset,
                     self.timestamp_offset + duration,
-                    self.current_out
+                    self.current_out,
+                    self.current_no_speech_prob,
+                    self.current_avg_logprob
                 ))
             self.current_out = ''
+            self.no_speech_prob = 0.0
             offset = duration
             self.same_output_threshold = 0
             last_segment = None
         else:
             self.prev_out = self.current_out
+            self.pre_no_speech_prob = self.current_no_speech_prob
+            self.pre_avg_logprob = self.current_avg_logprob
 
         # update offset
         if offset is not None:

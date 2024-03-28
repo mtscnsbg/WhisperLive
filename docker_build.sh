@@ -1,0 +1,5 @@
+ANNOTATION="-20240301_1500"
+VERSION="v0.3.1"
+PROJECT_NAME="whisper-live"
+IMAGE_TAG=$PROJECT_NAME:$VERSION$ANNOTATION
+docker build -f ./docker/Dockerfile.gpu -t $IMAGE_TAG .
