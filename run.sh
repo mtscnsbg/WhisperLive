@@ -1,6 +1,8 @@
-ANNOTATION="-20240301_1500"
+ANNOTATION="-20240418_1300"
 VERSION="v0.3.1"
 PROJECT_NAME="whisper-live"
 IMAGE_TAG=$PROJECT_NAME:$VERSION$ANNOTATION
 
-docker run -d -v $HOME/models/whisper/huggingface:/root/.cache/huggingface --name $PROJECT_NAME --gpus all -p 9090:9090 $IMAGE_TAG
+
+
+docker run -d -e WHISPER_LIVE_MAX_CLIENTS='2' -e WHISPER_LIVE_MAX_CONNECT_TIMEOUT='86400'   -v $HOME/models/whisper/huggingface:/root/.cache/huggingface --name $PROJECT_NAME --gpus all -p 9090:9090 $IMAGE_TAG

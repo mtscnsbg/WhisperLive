@@ -57,6 +57,7 @@ class ClientManager:
         """
         self.clients[websocket] = client
         self.start_times[websocket] = time.time()
+        logging.info(f"[add_client] whisperlive clients count: {len(self.clients)}.")
 
     def get_client(self, websocket):
         """
@@ -84,6 +85,7 @@ class ClientManager:
         if client:
             client.cleanup()
         self.start_times.pop(websocket, None)
+        logging.info(f"[remove_client] whisperlive clients count: {len(self.clients)}.")
 
     def get_wait_time(self):
         """
@@ -110,6 +112,7 @@ class ClientManager:
         Returns:
             True if the server is full, False otherwise.
         """
+        logging.info(f"[is_server_full] whisperlive clients count: {len(self.clients)}.")
         if len(self.clients) >= self.max_clients:
             wait_time = self.get_wait_time()
             response = {"uid": options["uid"], "status": "WAIT", "message": wait_time}
